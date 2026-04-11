@@ -37,8 +37,17 @@ def refreshed_db(sample_beads_dir, tmp_path):
 class TestRefreshAgainstSampleData:
     def test_all_tables_populated(self, refreshed_db):
         db_path, counts = refreshed_db
-        # Every table should have at least one row
+        # Every Dolt-sourced table should have at least one row. Skip private
+        # status keys (prefixed with _) and tables that can legitimately be
+        # empty when their source isn't populated in sample-data
+        # (fact_interactions depends on interactions.jsonl; dim_agent_memory
+        # depends on kv.memory.* keys in Dolt config).
+        optional_empty = {"fact_interactions", "dim_agent_memory"}
         for table, n in counts.items():
+            if table.startswith("_"):
+                continue
+            if table in optional_empty:
+                continue
             assert n > 0, f"{table} is empty after refresh"
 
     def test_counts_match_sample_data_shape(self, refreshed_db):
@@ -49,6 +58,10 @@ class TestRefreshAgainstSampleData:
         assert counts["fact_bead_lifecycle"] == 34
         assert counts["fact_bead_events"] > counts["dim_bead"]  # multiple events per bead
         assert counts["dim_actor"] >= 1
+        # Session detection should cluster the 34 beads into at least one session
+        assert counts["dim_session"] >= 1
+        # interactions status is reported even when the file is absent
+        assert counts["_interactions_status"] in ("missing", "empty", "populated")
 
     def test_every_bead_has_lifecycle_row(self, refreshed_db):
         db_path, _ = refreshed_db
