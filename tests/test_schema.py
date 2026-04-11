@@ -13,12 +13,16 @@ class TestSchemaCreation:
         ).fetchall()
         table_names = [t[0] for t in tables]
         assert table_names == [
+            "bridge_session_bead",
             "dim_actor",
+            "dim_agent_memory",
             "dim_bead",
             "dim_hierarchy",
+            "dim_session",
             "fact_bead_events",
             "fact_bead_lifecycle",
             "fact_dep_activity",
+            "fact_interactions",
         ]
 
     def test_all_views_created(self, duckdb_conn):
@@ -31,8 +35,25 @@ class TestSchemaCreation:
         assert view_names == [
             "mart_epic_summary",
             "mart_project_summary",
+            "mart_session_summary",
             "v_bead_dep_activity",
             "v_bead_scores",
+            "v_close_reasons",
+            "v_close_velocity",
+            "v_daily_activity",
+            "v_daily_trends",
+            "v_dep_order_violations",
+            "v_interaction_hourly",
+            "v_interaction_summary",
+            "v_model_usage",
+            "v_priority_performance",
+            "v_queue_wait",
+            "v_session_compliance",
+            "v_spec_quality_correlation",
+            "v_status_transitions",
+            "v_title_reason_pairs",
+            "v_tool_usage",
+            "v_type_performance",
             "v_weekly_trends",
         ]
 
@@ -58,8 +79,29 @@ class TestSchemaCreation:
 
     def test_views_work_on_empty_tables(self, duckdb_conn):
         """Views should return 0 rows on empty tables without error."""
-        for view in ["v_bead_scores", "v_bead_dep_activity",
-                      "mart_epic_summary", "v_weekly_trends"]:
+        for view in [
+            "v_bead_scores",
+            "v_bead_dep_activity",
+            "mart_epic_summary",
+            "mart_session_summary",
+            "v_weekly_trends",
+            "v_daily_trends",
+            "v_interaction_summary",
+            "v_model_usage",
+            "v_tool_usage",
+            "v_interaction_hourly",
+            "v_status_transitions",
+            "v_close_reasons",
+            "v_daily_activity",
+            "v_close_velocity",
+            "v_dep_order_violations",
+            "v_title_reason_pairs",
+            "v_queue_wait",
+            "v_spec_quality_correlation",
+            "v_priority_performance",
+            "v_type_performance",
+            "v_session_compliance",
+        ]:
             result = duckdb_conn.execute(f"SELECT * FROM {view}").fetchall()
             assert result == []
 
