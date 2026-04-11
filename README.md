@@ -4,29 +4,45 @@ Thread is a read-only forensics and analytics layer for [Beads](https://github.c
 
 ## Quickstart
 
+Install Thread as a user tool (uv / pipx / pip all work):
+
 ```bash
-# 1. Install (from the repo root)
-uv sync
+uv tool install git+https://github.com/jklenk/thread
+# or: pipx install git+https://github.com/jklenk/thread
+# or: pip install git+https://github.com/jklenk/thread
+```
 
-# 2. Point Thread at a Beads directory and build the analytical database.
-#    By default it looks in ./.beads; override with --beads-dir or BEADS_DIR.
-uv run python -m thread.cli refresh
+Then, from any Beads project directory:
 
-# 3. Project health summary (plain English)
-uv run python -m thread.cli prime
+```bash
+# 1. Extract Beads Dolt history into the analytical database.
+#    By default Thread looks in ./.beads; override with --beads-dir or BEADS_DIR.
+thread refresh
 
-# 4. Same summary as JSON for agents / scripts
-uv run python -m thread.cli prime --json
+# 2. Project health summary (plain English)
+thread prime
 
-# 5. Self-contained HTML report
-uv run python -m thread.cli report --output thread-report.html
+# 3. Same summary as JSON for agents / scripts
+thread prime --json
+
+# 4. Self-contained HTML report
+thread report --output thread-report.html
 open thread-report.html
 
-# 6. Ad-hoc SQL against the DuckDB database
-uv run python -m thread.cli query "SELECT COUNT(*) FROM dim_bead"
+# 5. Ad-hoc SQL against the DuckDB database
+thread query "SELECT COUNT(*) FROM dim_bead"
 ```
 
 Thread is strictly read-only — it never writes to Beads or Dolt. All output lands in `.beads/thread.duckdb` plus whatever HTML/JSON you ask for.
+
+**Contributor setup** (running from a checkout):
+
+```bash
+git clone https://github.com/jklenk/thread
+cd thread
+uv sync
+uv run thread prime
+```
 
 ## What Thread is
 
