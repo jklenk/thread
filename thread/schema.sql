@@ -290,3 +290,366 @@ LEFT JOIN dim_actor ca      ON ca.actor_key = f.closer_actor_key
 WHERE f.final_closed_at IS NOT NULL
 GROUP BY DATE_TRUNC('week', f.final_closed_at)
 ORDER BY week;
+
+
+-- ============================================================
+-- THREAD v2 — SESSIONS, INTERACTIONS, COMPLIANCE, CORRELATIONS
+-- ============================================================
+-- Added by Thread v2 Phase 1 (strands-ef3). Tables and views
+-- backing session detection, interactions audit trail, behavioral
+-- compliance signals, queue wait, spec/priority/type correlations,
+-- daily trends, session-level compliance rollup, and agent memories.
+
+-- ============================================================
+-- v2 DIMENSION / FACT TABLES
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS dim_session (
+  session_id    VARCHAR PRIMARY KEY,
+  started_at    TIMESTAMP,
+  ended_at      TIMESTAMP,
+  duration_secs BIGINT,
+  bead_count    INT,
+  beads_closed  INT,
+  beads_open    INT,
+  epics_touched INT,
+  actor_key     VARCHAR,
+  issue_types   VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS bridge_session_bead (
+  session_id VARCHAR,
+  issue_id   VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS fact_interactions (
+  interaction_id  VARCHAR PRIMARY KEY,
+  kind            VARCHAR,
+  created_at      TIMESTAMP,
+  actor           VARCHAR,
+  issue_id        VARCHAR,
+  model           VARCHAR,
+  prompt_length   INT,
+  response_length INT,
+  error           VARCHAR,
+  tool_name       VARCHAR,
+  exit_code       INT,
+  parent_id       VARCHAR,
+  label           VARCHAR,
+  reason          VARCHAR,
+  extra_json      VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS dim_agent_memory (
+  memory_key   VARCHAR PRIMARY KEY,
+  memory_value VARCHAR,
+  extracted_at TIMESTAMP
+);
+
+-- ============================================================
+-- v2 VIEWS
+-- ============================================================
+
+-- Session summary with efficiency metrics.
+-- LEFT JOIN bridge so sessions with no linked beads still appear.
+CREATE OR REPLACE VIEW mart_session_summary AS
+SELECT
+  s.session_id,
+  s.started_at,
+  s.ended_at,
+  s.duration_secs,
+  s.bead_count,
+  s.beads_closed,
+  s.beads_open,
+  s.epics_touched,
+  s.issue_types,
+  ROUND(
+    SUM(COALESCE(f.active_time_secs, 0)) * 1.0
+    / NULLIF(s.duration_secs, 0)
+  , 2)                                                          AS parallelism_ratio,
+  ROUND(AVG(f.total_elapsed_secs), 0)                           AS avg_cycle_time_secs,
+  ROUND(
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY f.total_elapsed_secs)
+  , 0)                                                          AS median_cycle_time_secs,
+  ROUND(
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY f.total_elapsed_secs)
+  , 0)                                                          AS p90_cycle_time_secs,
+  COALESCE(SUM(da.post_claim_dep_events), 0)                    AS scope_changes
+FROM dim_session s
+LEFT JOIN bridge_session_bead sb   ON sb.session_id = s.session_id
+LEFT JOIN fact_bead_lifecycle f    ON f.issue_id = sb.issue_id
+LEFT JOIN v_bead_dep_activity da   ON da.issue_id = sb.issue_id
+GROUP BY s.session_id, s.started_at, s.ended_at, s.duration_secs,
+         s.bead_count, s.beads_closed, s.beads_open, s.epics_touched, s.issue_types;
+
+
+-- Daily trends — replaces the weekly default for report/prime.
+-- v_weekly_trends is kept alongside for anyone using it directly.
+CREATE OR REPLACE VIEW v_daily_trends AS
+SELECT
+  DATE_TRUNC('day', f.final_closed_at)                          AS day,
+  COUNT(*)                                                      AS beads_closed,
+  ROUND(
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY f.total_elapsed_secs)
+  , 0)                                                          AS median_cycle_time_secs,
+  ROUND(
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY f.total_elapsed_secs)
+  , 0)                                                          AS p90_cycle_time_secs,
+  ROUND(
+    COUNT(CASE WHEN ca.actor_class = 'agent' THEN 1 END) * 1.0
+    / NULLIF(COUNT(*), 0)
+  , 2)                                                          AS agent_closure_rate
+FROM fact_bead_lifecycle f
+LEFT JOIN dim_actor ca ON ca.actor_key = f.closer_actor_key
+WHERE f.final_closed_at IS NOT NULL
+GROUP BY DATE_TRUNC('day', f.final_closed_at)
+ORDER BY day;
+
+
+-- Interactions: breakdown by kind
+CREATE OR REPLACE VIEW v_interaction_summary AS
+SELECT
+  kind,
+  COUNT(*)                          AS count,
+  COUNT(DISTINCT issue_id)          AS beads_touched,
+  COUNT(DISTINCT actor)             AS actors,
+  MIN(created_at)                   AS first_at,
+  MAX(created_at)                   AS last_at
+FROM fact_interactions
+GROUP BY kind;
+
+
+-- Interactions: LLM model usage (populated when llm_call records exist)
+CREATE OR REPLACE VIEW v_model_usage AS
+SELECT
+  model,
+  COUNT(*)                                                      AS calls,
+  AVG(prompt_length)                                            AS avg_prompt_chars,
+  AVG(response_length)                                          AS avg_response_chars,
+  COUNT(CASE WHEN error IS NOT NULL THEN 1 END)                 AS errors,
+  COUNT(DISTINCT issue_id)                                      AS beads_touched
+FROM fact_interactions
+WHERE kind = 'llm_call' AND model IS NOT NULL
+GROUP BY model;
+
+
+-- Interactions: tool usage (populated when tool_call records exist)
+CREATE OR REPLACE VIEW v_tool_usage AS
+SELECT
+  tool_name,
+  COUNT(*)                                                      AS calls,
+  COUNT(CASE WHEN exit_code = 0 THEN 1 END)                     AS successes,
+  COUNT(CASE WHEN exit_code != 0 OR error IS NOT NULL THEN 1 END) AS failures,
+  ROUND(
+    COUNT(CASE WHEN exit_code = 0 THEN 1 END) * 100.0
+    / NULLIF(COUNT(*), 0)
+  , 1)                                                          AS success_rate,
+  COUNT(DISTINCT issue_id)                                      AS beads_touched
+FROM fact_interactions
+WHERE kind = 'tool_call' AND tool_name IS NOT NULL
+GROUP BY tool_name
+ORDER BY calls DESC;
+
+
+-- Interactions: hourly heatmap (day-of-week x hour)
+CREATE OR REPLACE VIEW v_interaction_hourly AS
+SELECT
+  EXTRACT(DOW FROM created_at)      AS day_of_week,
+  EXTRACT(HOUR FROM created_at)     AS hour_of_day,
+  COUNT(*)                          AS interactions,
+  COUNT(DISTINCT issue_id)          AS beads_touched
+FROM fact_interactions
+GROUP BY EXTRACT(DOW FROM created_at), EXTRACT(HOUR FROM created_at);
+
+
+-- Interactions: status transition breakdown (parses extra_json)
+CREATE OR REPLACE VIEW v_status_transitions AS
+SELECT
+  json_extract_string(extra_json, '$.old_value') AS from_status,
+  json_extract_string(extra_json, '$.new_value') AS to_status,
+  COUNT(*)                                       AS count,
+  COUNT(DISTINCT issue_id)                       AS beads
+FROM fact_interactions
+WHERE kind = 'field_change'
+  AND json_extract_string(extra_json, '$.field') = 'status'
+GROUP BY from_status, to_status
+ORDER BY count DESC;
+
+
+-- Interactions: non-trivial close reasons (effective commit messages for beads)
+CREATE OR REPLACE VIEW v_close_reasons AS
+SELECT
+  i.issue_id,
+  b.title                                        AS bead_title,
+  json_extract_string(i.extra_json, '$.reason')  AS close_reason,
+  i.created_at
+FROM fact_interactions i
+LEFT JOIN dim_bead b ON b.issue_id = i.issue_id
+WHERE i.kind = 'field_change'
+  AND json_extract_string(i.extra_json, '$.new_value') = 'closed'
+  AND json_extract_string(i.extra_json, '$.reason') IS NOT NULL
+  AND json_extract_string(i.extra_json, '$.reason') != 'Closed'
+ORDER BY i.created_at;
+
+
+-- Interactions: daily activity spans
+CREATE OR REPLACE VIEW v_daily_activity AS
+SELECT
+  CAST(created_at AS DATE)                                       AS day,
+  MIN(created_at)                                                AS first_activity,
+  MAX(created_at)                                                AS last_activity,
+  DATE_DIFF('second', MIN(created_at), MAX(created_at))          AS span_secs,
+  COUNT(*)                                                       AS interactions,
+  COUNT(DISTINCT issue_id)                                       AS beads_touched,
+  COUNT(DISTINCT actor)                                          AS actors
+FROM fact_interactions
+GROUP BY CAST(created_at AS DATE)
+ORDER BY day;
+
+
+-- Interactions: inter-close gaps for cadence / burst analysis
+CREATE OR REPLACE VIEW v_close_velocity AS
+SELECT
+  issue_id,
+  created_at,
+  LAG(created_at) OVER (ORDER BY created_at)                     AS prev_close_at,
+  DATE_DIFF(
+    'second',
+    LAG(created_at) OVER (ORDER BY created_at),
+    created_at
+  )                                                              AS gap_secs
+FROM fact_interactions
+WHERE kind = 'field_change'
+  AND json_extract_string(extra_json, '$.new_value') = 'closed'
+ORDER BY created_at;
+
+
+-- Compliance: dependency order violations (blocked bead closed before its blocker).
+-- LEFT JOIN on f1 so empty-table runs return 0 rows cleanly.
+CREATE OR REPLACE VIEW v_dep_order_violations AS
+SELECT
+  d.issue_id                 AS blocked_bead,
+  b1.title                   AS blocked_title,
+  d.depends_on_id            AS blocker_bead,
+  b2.title                   AS blocker_title,
+  f1.final_closed_at         AS blocked_closed_at,
+  f2.final_closed_at         AS blocker_closed_at
+FROM fact_dep_activity d
+LEFT JOIN fact_bead_lifecycle f1 ON f1.issue_id = d.issue_id
+LEFT JOIN fact_bead_lifecycle f2 ON f2.issue_id = d.depends_on_id
+LEFT JOIN dim_bead b1            ON b1.issue_id = d.issue_id
+LEFT JOIN dim_bead b2            ON b2.issue_id = d.depends_on_id
+WHERE d.dep_type = 'blocks'
+  AND d.dep_event = 'added'
+  AND f1.final_closed_at IS NOT NULL
+  AND (f2.final_closed_at IS NULL OR f2.final_closed_at > f1.final_closed_at);
+
+
+-- Compliance: title vs close reason pairs for human alignment review
+CREATE OR REPLACE VIEW v_title_reason_pairs AS
+SELECT
+  i.issue_id,
+  b.title,
+  json_extract_string(i.extra_json, '$.reason')  AS close_reason,
+  i.created_at
+FROM fact_interactions i
+LEFT JOIN dim_bead b ON b.issue_id = i.issue_id
+WHERE i.kind = 'field_change'
+  AND json_extract_string(i.extra_json, '$.new_value') = 'closed'
+  AND json_extract_string(i.extra_json, '$.reason') IS NOT NULL
+  AND json_extract_string(i.extra_json, '$.reason') != 'Closed'
+  AND b.title IS NOT NULL
+ORDER BY i.created_at;
+
+
+-- Queue wait: time-to-start for beads that were claimed
+CREATE OR REPLACE VIEW v_queue_wait AS
+SELECT
+  f.issue_id,
+  f.time_to_start_secs,
+  b.issue_type,
+  b.priority
+FROM fact_bead_lifecycle f
+LEFT JOIN dim_bead b ON b.issue_id = f.issue_id
+WHERE f.first_claimed_at IS NOT NULL;
+
+
+-- Correlation: does specification depth correlate with outcomes?
+CREATE OR REPLACE VIEW v_spec_quality_correlation AS
+SELECT
+  CASE
+    WHEN b.has_design              THEN 'design + description'
+    WHEN b.has_acceptance_criteria THEN 'acceptance criteria'
+    WHEN b.has_description         THEN 'description only'
+    ELSE 'no spec'
+  END                                                             AS spec_level,
+  COUNT(*)                                                        AS bead_count,
+  COUNT(CASE WHEN f.final_closed_at IS NOT NULL THEN 1 END)       AS completed,
+  ROUND(
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY f.total_elapsed_secs)
+  , 0)                                                            AS median_cycle_secs,
+  ROUND(AVG(f.total_elapsed_secs), 0)                             AS avg_cycle_secs,
+  ROUND(AVG(f.time_to_start_secs), 0)                             AS avg_wait_secs
+FROM dim_bead b
+LEFT JOIN fact_bead_lifecycle f ON f.issue_id = b.issue_id
+GROUP BY spec_level
+ORDER BY median_cycle_secs;
+
+
+-- Correlation: does priority drive speed?
+CREATE OR REPLACE VIEW v_priority_performance AS
+SELECT
+  b.priority,
+  COUNT(*)                                                        AS bead_count,
+  COUNT(CASE WHEN f.final_closed_at IS NOT NULL THEN 1 END)       AS completed,
+  ROUND(
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY f.total_elapsed_secs)
+  , 0)                                                            AS median_cycle_secs,
+  ROUND(
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY f.total_elapsed_secs)
+  , 0)                                                            AS p90_cycle_secs,
+  ROUND(AVG(f.time_to_start_secs), 0)                             AS avg_wait_secs
+FROM dim_bead b
+LEFT JOIN fact_bead_lifecycle f ON f.issue_id = b.issue_id
+GROUP BY b.priority
+ORDER BY b.priority;
+
+
+-- Correlation: cycle time by issue_type (tasks vs features vs bugs vs epics)
+CREATE OR REPLACE VIEW v_type_performance AS
+SELECT
+  b.issue_type,
+  COUNT(*)                                                        AS bead_count,
+  COUNT(CASE WHEN f.final_closed_at IS NOT NULL THEN 1 END)       AS completed,
+  ROUND(
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY f.total_elapsed_secs)
+  , 0)                                                            AS median_cycle_secs,
+  ROUND(
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY f.total_elapsed_secs)
+  , 0)                                                            AS p90_cycle_secs,
+  ROUND(AVG(da.post_claim_dep_events), 2)                         AS avg_scope_changes
+FROM dim_bead b
+LEFT JOIN fact_bead_lifecycle f  ON f.issue_id = b.issue_id
+LEFT JOIN v_bead_dep_activity da ON da.issue_id = b.issue_id
+GROUP BY b.issue_type
+ORDER BY median_cycle_secs;
+
+
+-- Compliance: per-session rollup (skip-claim, documentation, dep violations)
+CREATE OR REPLACE VIEW v_session_compliance AS
+SELECT
+  sb.session_id,
+  COUNT(DISTINCT sb.issue_id)                                     AS beads_in_session,
+  COUNT(DISTINCT CASE
+    WHEN f.first_claimed_at IS NULL AND f.final_closed_at IS NOT NULL
+    THEN sb.issue_id
+  END)                                                            AS skip_claim_count,
+  COUNT(DISTINCT CASE
+    WHEN cr.close_reason IS NOT NULL THEN sb.issue_id
+  END)                                                            AS documented_closes,
+  COUNT(DISTINCT dv.blocked_bead)                                 AS dep_violations
+FROM bridge_session_bead sb
+LEFT JOIN fact_bead_lifecycle f    ON f.issue_id = sb.issue_id
+LEFT JOIN v_close_reasons cr       ON cr.issue_id = sb.issue_id
+LEFT JOIN v_dep_order_violations dv ON dv.blocked_bead = sb.issue_id
+GROUP BY sb.session_id;
