@@ -162,46 +162,52 @@ class TestPrimeAgainstSampleData:
         db_path, _ = refreshed_db
         data = compute_prime(db_path)
 
-        # Required keys present
+        # Required v2 keys present
         required = {
             "workflow_type", "total_beads", "epic_count", "singleton_bead_count",
-            "singleton_signal",
-            "project_fidelity_score", "fidelity_signal",
-            "avg_effort_score", "effort_signal",
-            "avg_elapsed_vs_estimate", "elapsed_signal",
-            "avg_quality_score", "quality_signal",
-            "agent_closure_rate", "agent_closure_signal",
-            "dep_activity_rate", "dep_activity_signal",
-            "orphan_bead_rate", "orphan_signal",
-            "actor_classification_note",
+            "completion_rate", "completion_signal", "completion_verdict",
+            "cycle_time_p50_secs", "cycle_time_p90_secs", "cycle_time_verdict",
+            "throughput_beads_per_day", "throughput_verdict",
+            "cost_p90_multiple", "cost_verdict",
+            "parallelism_ratio", "parallelism_verdict",
+            "agent_closure_rate", "agent_closure_signal", "agent_closure_verdict",
+            "scope_stability_rate", "scope_stability_verdict",
+            "skip_claim_rate", "skip_claim_verdict",
+            "documentation_rate", "documentation_verdict",
+            "dep_order_violations", "dep_order_verdict",
+            "queue_wait_p50_secs", "queue_wait_verdict",
+            "interactions", "agent_knowledge", "trend",
+            "recent_sessions",
         }
         assert required.issubset(data.keys())
 
-        # Workflow type must be one of the known values
         assert data["workflow_type"] in ("epic", "flat", "mixed", "empty")
-
-        # Sample-data is a clean agentic project — fidelity should be high
-        assert data["project_fidelity_score"] >= 0.9
+        assert data["completion_rate"] >= 0.7
         assert data["agent_closure_rate"] == 1.0
+
+        for key, val in data.items():
+            if key.endswith("_verdict"):
+                assert val in ("good", "watch", "concern"), f"{key} = {val}"
 
     def test_format_human_is_string(self, refreshed_db):
         db_path, _ = refreshed_db
         data = compute_prime(db_path)
         out = format_human(data)
         assert isinstance(out, str)
-        assert "Fidelity score" in out
-        assert "Rework cost" in out
-        assert "Workflow:" in out
+        assert "Thread" in out
+        assert "completed" in out
 
     def test_format_json_is_valid_json(self, refreshed_db):
         db_path, _ = refreshed_db
         data = compute_prime(db_path)
         out = format_json(data)
         parsed = json.loads(out)
-        assert parsed["project_fidelity_score"] == data["project_fidelity_score"]
+        assert parsed["completion_rate"] == data["completion_rate"]
+        assert "interactions" in parsed
+        assert "status" in parsed["interactions"]
 
     def test_signals_are_plain_language(self, refreshed_db):
-        """No technical terms like 'fidelity_score' in user-facing signals."""
+        """No technical terms in user-facing signal strings."""
         db_path, _ = refreshed_db
         data = compute_prime(db_path)
         technical_terms = [
@@ -209,11 +215,20 @@ class TestPrimeAgainstSampleData:
             "revision_requested", "active_time_secs", "compaction_level",
             "dim_bead", "fact_bead", "v_bead_scores",
         ]
-        for key, val in data.items():
-            if not isinstance(val, str):
-                continue
-            for term in technical_terms:
-                assert term not in val, f"{key} contains technical term '{term}'"
+
+        def _check(obj, path=""):
+            if isinstance(obj, str):
+                for term in technical_terms:
+                    assert term not in obj, f"{path} contains '{term}'"
+            elif isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k.endswith("_signal") or k in ("signal", "assessment"):
+                        _check(v, f"{path}.{k}")
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    _check(item, f"{path}[{i}]")
+
+        _check(data)
 
 
 class TestReportAgainstSampleData:
