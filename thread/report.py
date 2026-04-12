@@ -237,14 +237,19 @@ def _render_html(data, detail):
     """Render the full HTML report."""
     parts = []
 
-    # Derive project name from first bead ID prefix
+    # Derive project name from the most common bead ID prefix.
+    # Bead IDs look like "data-eng-summary-izl" — the last segment is the
+    # unique hash, everything before it is the project prefix. Only use the
+    # prefix if it has multiple segments (e.g., "data-eng-summary"), otherwise
+    # it's just the repo directory name and "Thread" is a better default.
     project_name = "Thread"
     if detail["project_name"] and detail["project_name"][0]:
         bid = detail["project_name"][0]
-        # Strip last segment (the unique part)
-        segments = bid.rsplit("-", 1)
-        if len(segments) > 1 and len(segments[0]) > 2:
-            project_name = segments[0]
+        prefix = bid.rsplit("-", 1)[0] if "-" in bid else bid
+        # Only use prefix if it contains a hyphen itself (multi-segment),
+        # indicating a real project name like "data-eng-summary"
+        if "-" in prefix:
+            project_name = prefix
 
     # Date range
     dr = detail["date_range"]
