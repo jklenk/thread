@@ -699,10 +699,34 @@ def compute_prime(db_path: str, beads_dir: str | None = None) -> dict:
             int_status = "populated"
             int_message = _interactions_signal(total_interactions, by_kind)
 
+        # Models and tools from interactions
+        model_rows = conn.execute(
+            "SELECT model, calls FROM v_model_usage ORDER BY calls DESC"
+        ).fetchall()
+        models_used = [{"model": r[0], "count": int(r[1])} for r in model_rows] if model_rows else []
+
+        tool_rows = conn.execute(
+            "SELECT tool_name, calls, successes, failures, success_rate "
+            "FROM v_tool_usage ORDER BY calls DESC"
+        ).fetchall()
+        tools_used = [
+            {"tool": r[0], "calls": int(r[1]), "success_rate": float(r[4]) if r[4] else None}
+            for r in tool_rows
+        ] if tool_rows else []
+
+        tool_success_rate = None
+        if tools_used:
+            total_calls = sum(t["calls"] for t in tools_used)
+            success_calls = sum(int(r[2]) for r in tool_rows)
+            tool_success_rate = round(success_calls / total_calls, 3) if total_calls > 0 else None
+
         data["interactions"] = {
             "status": int_status,
             "total": total_interactions,
             "by_kind": by_kind,
+            "models_used": models_used,
+            "tools_used": tools_used,
+            "tool_success_rate": tool_success_rate,
             "signal": int_message if int_status != "populated" else _interactions_signal(total_interactions, by_kind),
             "message": int_message,
         }
@@ -713,8 +737,14 @@ def compute_prime(db_path: str, beads_dir: str | None = None) -> dict:
         ).fetchone()
         mem_count = mem_row[0] if mem_row else 0
 
+        mem_entries = conn.execute(
+            "SELECT memory_key, memory_value FROM dim_agent_memory ORDER BY memory_key"
+        ).fetchall()
+        memories = [{"key": r[0], "value": r[1]} for r in mem_entries] if mem_entries else []
+
         data["agent_knowledge"] = {
             "count": mem_count,
+            "memories": memories,
             "signal": (
                 f"agents have built institutional context across sessions"
                 if mem_count > 0
