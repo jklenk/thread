@@ -96,6 +96,11 @@ CREATE TABLE IF NOT EXISTS fact_dep_activity (
 -- VIEWS
 -- ============================================================
 
+-- v_bead_scores — v2: replaces flatlined fidelity/effort formulas.
+-- fidelity_score: compliance-based (1.0 if claimed before close, documented,
+--   no dep violations; penalties for skipping workflow steps).
+-- effort_score: relative cost multiple (active_time / project median).
+-- base_cost_hours: retained as throughput signal.
 CREATE OR REPLACE VIEW v_bead_scores AS
 SELECT
   f.issue_id,
@@ -112,25 +117,26 @@ SELECT
   f.creator_actor_key,
   f.closer_actor_key,
 
-  -- base_cost_hours retained as throughput signal (not in effort_score)
   ROUND(COALESCE(f.active_time_secs, 0) / 3600.0, 2)   AS base_cost_hours,
 
+  -- fidelity_score v2: compliance-based, penalises workflow shortcuts
   ROUND(
-    1.0 - LEAST(1.0,
-      (COALESCE(f.reopen_count, 0) * 0.4)
-      + (COALESCE(f.revision_requested_count, 0) * 0.4)
-      + (COALESCE(f.rejected_count, 0) * 0.2)
-    ), 2
-  )                                                       AS fidelity_score,
+    1.0
+    - (CASE WHEN f.first_claimed_at IS NULL AND f.final_closed_at IS NOT NULL
+            THEN 0.4 ELSE 0 END)             -- skip-claim penalty
+    - (COALESCE(f.reopen_count, 0) * 0.3)    -- reopen penalty (still relevant)
+    - (COALESCE(f.rejected_count, 0) * 0.2)  -- rejection penalty
+  , 2)                                                    AS fidelity_score,
 
-  -- effort_score is purely event-driven. Wall clock is not a cost signal
-  -- in agentic workflows (see DESIGN_v0.8 §Change 1).
+  -- effort_score v2: relative cost multiple (active_time / project p50)
+  -- Falls back to 0.5 when median is unavailable (single-bead projects)
   ROUND(
-    (COALESCE(f.reopen_count, 0) * 2.0)
-    + (COALESCE(f.revision_requested_count, 0) * 1.5)
-    + (COALESCE(f.rejected_count, 0) * 1.0)
-    + (COALESCE(f.compaction_level, 0) * 1.0)
-    + (COALESCE(f.agent_actor_count, 0) * 0.5)
+    COALESCE(
+      f.active_time_secs * 1.0
+      / NULLIF((SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY active_time_secs)
+                FROM fact_bead_lifecycle WHERE final_closed_at IS NOT NULL), 0),
+      0.5
+    )
   , 2)                                                    AS effort_score
 
 FROM fact_bead_lifecycle f;
