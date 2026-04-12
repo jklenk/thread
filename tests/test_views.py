@@ -64,63 +64,64 @@ def _insert_dep_activity(conn, issue_id="bd-001", depends_on="bd-002",
 
 class TestVBeadScores:
     def test_fidelity_score_perfect(self, duckdb_conn):
-        """No reopens/revisions/rejections = 1.0 fidelity."""
-        _insert_lifecycle(duckdb_conn, reopen_count=0,
-                         revision_requested_count=0, rejected_count=0)
+        """Claimed bead with no reopens/rejections = 1.0 fidelity."""
+        _insert_lifecycle(duckdb_conn, reopen_count=0, rejected_count=0)
         row = duckdb_conn.execute(
             "SELECT fidelity_score FROM v_bead_scores"
         ).fetchone()
         assert float(row[0]) == 1.0
 
     def test_fidelity_score_with_reopens(self, duckdb_conn):
-        """1 reopen = 1.0 - (1*0.4) = 0.6."""
+        """1 reopen = 1.0 - (1*0.3) = 0.7."""
         _insert_lifecycle(duckdb_conn, reopen_count=1)
         row = duckdb_conn.execute(
             "SELECT fidelity_score FROM v_bead_scores"
         ).fetchone()
+        assert float(row[0]) == 0.7
+
+    def test_fidelity_score_skip_claim_penalty(self, duckdb_conn):
+        """Closed without claiming incurs 0.4 penalty."""
+        # Insert directly with NULL first_claimed_at
+        duckdb_conn.execute(
+            "INSERT INTO fact_bead_lifecycle VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ["bd-skip", "2026-04-05 15:00:00", None,
+             "2026-04-05 16:00:00", "2026-04-05 16:00:00",
+             None, 3600, 3600,
+             0, 1, 0, None, 0, 0, 0,
+             None, None, True, "user", "user"],
+        )
+        row = duckdb_conn.execute(
+            "SELECT fidelity_score FROM v_bead_scores WHERE issue_id = 'bd-skip'"
+        ).fetchone()
         assert float(row[0]) == 0.6
 
-    def test_fidelity_score_capped_at_zero(self, duckdb_conn):
-        """Fidelity never goes below 0.0."""
-        _insert_lifecycle(duckdb_conn, reopen_count=3,
-                         revision_requested_count=3, rejected_count=5)
-        row = duckdb_conn.execute(
-            "SELECT fidelity_score FROM v_bead_scores"
-        ).fetchone()
-        assert float(row[0]) == 0.0
-
-    def test_effort_score_formula(self, duckdb_conn):
-        """Verify effort is event-driven only (no wall clock)."""
-        _insert_lifecycle(duckdb_conn, active_time_secs=3600,
-                         reopen_count=1, revision_requested_count=1,
-                         rejected_count=1, compaction_level=2,
-                         agent_actor_count=1)
+    def test_effort_score_is_cost_multiple(self, duckdb_conn):
+        """effort_score is now a relative cost multiple (active_time / median)."""
+        _insert_lifecycle(duckdb_conn, active_time_secs=3600)
         row = duckdb_conn.execute(
             "SELECT effort_score, base_cost_hours FROM v_bead_scores"
         ).fetchone()
-        # effort = (1*2.0) + (1*1.5) + (1*1.0) + (2*1.0) + (1*0.5) = 7.0
-        # active_time_secs is NOT in effort_score anymore (kept as throughput signal)
-        assert float(row[0]) == 7.0
-        # base_cost_hours still surfaced as a throughput signal
+        # Single bead: active_time / median(active_time) = 1.0
+        assert float(row[0]) == 1.0
         assert float(row[1]) == 1.0
 
-    def test_effort_score_excludes_wall_clock(self, duckdb_conn):
-        """Wall clock time must not inflate effort_score.
-
-        Regression: a bead with 100h of active_time but zero rework events
-        should score 0 effort — it completed on first pass.
-        """
-        _insert_lifecycle(duckdb_conn, active_time_secs=360000,
-                         reopen_count=0, revision_requested_count=0,
-                         rejected_count=0, compaction_level=0,
-                         agent_actor_count=1)
-        row = duckdb_conn.execute(
-            "SELECT effort_score, base_cost_hours FROM v_bead_scores"
-        ).fetchone()
-        # agent_actor_count=1 contributes 0.5; no rework/compaction
-        assert float(row[0]) == 0.5
-        # base_cost_hours still reflects wall clock for throughput queries
-        assert float(row[1]) == 100.0
+    def test_effort_score_relative_to_median(self, duckdb_conn):
+        """A bead 2x the median active time should have effort_score ~2.0."""
+        # Insert two beads: one at 1000s, one at 2000s. Median = 1500.
+        _insert_lifecycle(duckdb_conn, issue_id="bd-fast",
+                         active_time_secs=1000)
+        _insert_dim_bead(duckdb_conn, issue_id="bd-fast")
+        _insert_lifecycle(duckdb_conn, issue_id="bd-slow",
+                         active_time_secs=3000)
+        _insert_dim_bead(duckdb_conn, issue_id="bd-slow")
+        rows = duckdb_conn.execute(
+            "SELECT issue_id, effort_score FROM v_bead_scores ORDER BY issue_id"
+        ).fetchall()
+        scores = {r[0]: float(r[1]) for r in rows}
+        # median of [1000, 3000] = 2000. fast=0.5, slow=1.5
+        assert scores["bd-fast"] == 0.5
+        assert scores["bd-slow"] == 1.5
 
     def test_has_actor_keys(self, duckdb_conn):
         _insert_lifecycle(duckdb_conn, creator="alice", closer="bob")
