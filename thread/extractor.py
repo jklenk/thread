@@ -529,6 +529,257 @@ def extract_fact_dep_activity(dolt_conn, duck_conn):
 
 
 # ============================================================
+# 7. dim_session + bridge_session_bead  (Thread v2)
+# ============================================================
+
+# Session gap threshold. Calibrated against real-data smallest inter-session
+# gap of ~13 minutes. This is a calibration target — expose as a CLI flag
+# or auto-detect from the gap distribution in a later phase.
+SESSION_GAP_SECS = 15 * 60
+
+
+def extract_sessions(duck_conn):
+    """Cluster beads into sessions by created_at gap.
+
+    Reads from DuckDB (fact_bead_lifecycle + dim_hierarchy + dim_bead), so this
+    must run AFTER the Dolt-based extractors have populated those tables.
+    Populates dim_session and bridge_session_bead.
+    """
+    rows = duck_conn.execute(
+        """
+        SELECT
+          f.issue_id,
+          f.created_at,
+          f.final_closed_at,
+          f.creator_actor_key,
+          COALESCE(h.root_id, f.issue_id) AS root_id,
+          b.issue_type
+        FROM fact_bead_lifecycle f
+        LEFT JOIN dim_hierarchy h ON h.issue_id = f.issue_id
+        LEFT JOIN dim_bead b       ON b.issue_id = f.issue_id
+        WHERE f.created_at IS NOT NULL
+        ORDER BY f.created_at
+        """
+    ).fetchall()
+
+    if not rows:
+        return 0
+
+    sessions: list[dict] = []
+    current: dict | None = None
+
+    for issue_id, created_at, closed_at, actor, root_id, issue_type in rows:
+        if current is None:
+            current = _new_session_bucket(created_at)
+        else:
+            gap = (created_at - current["last_activity"]).total_seconds()
+            if gap > SESSION_GAP_SECS:
+                sessions.append(current)
+                current = _new_session_bucket(created_at)
+
+        current["beads"].append((issue_id, created_at, closed_at))
+        if actor:
+            current["actors"].add(actor)
+        if root_id:
+            current["roots"].add(root_id)
+        if issue_type:
+            current["types"].add(issue_type)
+
+        # last_activity is the max timestamp we've seen in this cluster so far.
+        # closed_at may be NULL or outside the session window, so guard it.
+        current["last_activity"] = max(
+            current["last_activity"],
+            created_at,
+            closed_at if closed_at is not None else current["last_activity"],
+        )
+
+    if current is not None:
+        sessions.append(current)
+
+    for idx, s in enumerate(sessions, start=1):
+        session_id = f"s-{idx:03d}"
+        started_at = s["started_at"]
+        ended_at = s["last_activity"]
+        duration = int((ended_at - started_at).total_seconds())
+        bead_count = len(s["beads"])
+        beads_closed = sum(
+            1
+            for _, _, c in s["beads"]
+            if c is not None and started_at <= c <= ended_at
+        )
+        beads_open = bead_count - beads_closed
+        epics_touched = len(s["roots"])
+        actor_key = next(iter(s["actors"]), None)
+        issue_types = ",".join(sorted(t for t in s["types"] if t))
+
+        duck_conn.execute(
+            "INSERT INTO dim_session VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                session_id,
+                started_at,
+                ended_at,
+                duration,
+                bead_count,
+                beads_closed,
+                beads_open,
+                epics_touched,
+                actor_key,
+                issue_types,
+            ],
+        )
+        for iid, _, _ in s["beads"]:
+            duck_conn.execute(
+                "INSERT INTO bridge_session_bead VALUES (?, ?)",
+                [session_id, iid],
+            )
+
+    return len(sessions)
+
+
+def _new_session_bucket(started_at) -> dict:
+    return {
+        "beads": [],
+        "started_at": started_at,
+        "last_activity": started_at,
+        "actors": set(),
+        "roots": set(),
+        "types": set(),
+    }
+
+
+# ============================================================
+# 8. fact_interactions  (Thread v2)
+# ============================================================
+
+def extract_interactions(beads_dir, duck_conn) -> dict:
+    """Read .beads/interactions.jsonl and populate fact_interactions.
+
+    Gracefully handles missing file, empty file, and malformed lines.
+    Returns a status dict consumed by prime/report to render the
+    graceful-degradation note:
+        {"status": "missing"|"empty"|"populated",
+         "row_count": int,
+         "message": str}
+    """
+    import json
+    from pathlib import Path
+
+    jsonl_path = Path(beads_dir) / "interactions.jsonl"
+    if not jsonl_path.exists():
+        return {
+            "status": "missing",
+            "row_count": 0,
+            "message": (
+                "interactions.jsonl not found — audit trail unavailable "
+                "(enable via `bd compact --audit` or agent hooks)"
+            ),
+        }
+
+    rows_inserted = 0
+    with jsonl_path.open("r", encoding="utf-8") as fh:
+        for line_num, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                # Skip malformed line but keep going — the audit trail should
+                # never fail the refresh pipeline.
+                continue
+
+            prompt = rec.get("prompt") or ""
+            response = rec.get("response") or ""
+            extra = rec.get("extra")
+            if isinstance(extra, (dict, list)):
+                extra_json = json.dumps(extra)
+            elif isinstance(extra, str):
+                extra_json = extra
+            else:
+                extra_json = None
+
+            interaction_id = rec.get("id") or f"i-{line_num:06d}"
+
+            duck_conn.execute(
+                "INSERT INTO fact_interactions VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    interaction_id,
+                    rec.get("kind"),
+                    rec.get("created_at"),
+                    rec.get("actor"),
+                    rec.get("issue_id"),
+                    rec.get("model"),
+                    len(prompt) if prompt else None,
+                    len(response) if response else None,
+                    rec.get("error"),
+                    rec.get("tool_name"),
+                    rec.get("exit_code"),
+                    rec.get("parent_id"),
+                    rec.get("label"),
+                    rec.get("reason"),
+                    extra_json,
+                ],
+            )
+            rows_inserted += 1
+
+    if rows_inserted == 0:
+        return {
+            "status": "empty",
+            "row_count": 0,
+            "message": (
+                "interactions.jsonl is empty — audit trail unavailable "
+                "(enable via `bd compact --audit` or agent hooks)"
+            ),
+        }
+
+    return {
+        "status": "populated",
+        "row_count": rows_inserted,
+        "message": f"{rows_inserted} interaction records loaded",
+    }
+
+
+# ============================================================
+# 9. dim_agent_memory  (Thread v2)
+# ============================================================
+
+def extract_agent_memories(dolt_conn, duck_conn):
+    """Query Dolt `config` for kv.memory.* keys and populate dim_agent_memory.
+
+    Gracefully returns 0 if the config table is absent or holds no memory keys.
+    """
+    from datetime import datetime, timezone
+
+    try:
+        with dolt_conn.cursor() as cur:
+            cur.execute(
+                "SELECT `key`, value FROM config WHERE `key` LIKE 'kv.memory.%%'"
+            )
+            rows = cur.fetchall()
+    except Exception:
+        return 0
+
+    extracted_at = datetime.now(timezone.utc)
+    count = 0
+    for row in rows:
+        if isinstance(row, dict):
+            key = row.get("key")
+            value = row.get("value")
+        else:
+            key = row[0]
+            value = row[1] if len(row) > 1 else None
+        if not key:
+            continue
+        duck_conn.execute(
+            "INSERT INTO dim_agent_memory VALUES (?, ?, ?)",
+            [key, value, extracted_at],
+        )
+        count += 1
+    return count
+
+
+# ============================================================
 # Orchestrator
 # ============================================================
 
@@ -569,6 +820,17 @@ def refresh(beads_dir: str | None = None, output_path: str | None = None):
         counts["fact_bead_events"] = extract_fact_bead_events(dolt_conn, duck)
         counts["fact_bead_lifecycle"] = extract_fact_bead_lifecycle(dolt_conn, duck)
         counts["fact_dep_activity"] = extract_fact_dep_activity(dolt_conn, duck)
+        counts["dim_agent_memory"] = extract_agent_memories(dolt_conn, duck)
+
+    # Session detection reads only from DuckDB (needs fact_bead_lifecycle and
+    # dim_hierarchy populated), so it runs after the Dolt connection closes.
+    counts["dim_session"] = extract_sessions(duck)
+
+    # Interactions audit trail reads from a local JSONL file, not Dolt.
+    interactions_result = extract_interactions(bd, duck)
+    counts["fact_interactions"] = interactions_result["row_count"]
+    counts["_interactions_status"] = interactions_result["status"]
+    counts["_interactions_message"] = interactions_result["message"]
 
     duck.close()
     return counts

@@ -7,11 +7,15 @@ import duckdb
 import pytest
 
 from thread.extractor import (
+    SESSION_GAP_SECS,
+    extract_agent_memories,
     extract_dim_bead,
     extract_dim_hierarchy,
     extract_fact_bead_events,
     extract_fact_bead_lifecycle,
     extract_fact_dep_activity,
+    extract_interactions,
+    extract_sessions,
     dep_category,
     _parse_hierarchy_from_id,
     _walk_to_root,
@@ -535,3 +539,224 @@ class TestExtractFactDepActivity:
             "SELECT dep_category FROM fact_dep_activity"
         ).fetchone()
         assert row[0] == "association"
+
+
+# ============================================================
+# extract_sessions  (Thread v2)
+# ============================================================
+
+def _insert_lifecycle(duck, issue_id, created_at, closed_at, creator="u"):
+    duck.execute(
+        "INSERT INTO fact_bead_lifecycle VALUES "
+        "(?, ?, NULL, NULL, ?, NULL, 0, NULL, 0, 0, 0, NULL, 0, 0, 0, "
+        "NULL, NULL, false, ?, NULL)",
+        [issue_id, created_at, closed_at, creator],
+    )
+
+
+def _insert_bead(duck, issue_id, issue_type="task"):
+    duck.execute(
+        "INSERT INTO dim_bead VALUES "
+        "(?, 'title', ?, 2, 'u', NULL, NULL, NULL, "
+        "true, false, false, NULL, NULL, NULL, false)",
+        [issue_id, issue_type],
+    )
+
+
+def _insert_hierarchy_flat(duck, issue_id):
+    duck.execute(
+        "INSERT INTO dim_hierarchy VALUES (?, NULL, ?, 0, true, ?)",
+        [issue_id, issue_id, issue_id],
+    )
+
+
+class TestExtractSessions:
+    def test_single_session_when_gaps_small(self, duckdb_conn):
+        t0 = datetime(2026, 4, 5, 21, 12, 0)
+        for i, offset in enumerate([0, 60, 180, 360]):  # 0, 1, 3, 6 minutes
+            iid = f"bd-{i}"
+            _insert_bead(duckdb_conn, iid)
+            _insert_hierarchy_flat(duckdb_conn, iid)
+            _insert_lifecycle(
+                duckdb_conn, iid,
+                t0 + timedelta(seconds=offset),
+                t0 + timedelta(seconds=offset + 30),
+            )
+
+        count = extract_sessions(duckdb_conn)
+        assert count == 1
+
+        rows = duckdb_conn.execute(
+            "SELECT session_id, bead_count, beads_closed, beads_open FROM dim_session"
+        ).fetchall()
+        assert rows[0] == ("s-001", 4, 4, 0)
+
+        bridge = duckdb_conn.execute(
+            "SELECT COUNT(*) FROM bridge_session_bead WHERE session_id = 's-001'"
+        ).fetchone()
+        assert bridge[0] == 4
+
+    def test_gap_over_threshold_starts_new_session(self, duckdb_conn):
+        t0 = datetime(2026, 4, 5, 21, 12, 0)
+        # Two sessions separated by > 15 minutes of silence
+        _insert_bead(duckdb_conn, "bd-a")
+        _insert_hierarchy_flat(duckdb_conn, "bd-a")
+        _insert_lifecycle(
+            duckdb_conn, "bd-a", t0, t0 + timedelta(minutes=1),
+        )
+        _insert_bead(duckdb_conn, "bd-b")
+        _insert_hierarchy_flat(duckdb_conn, "bd-b")
+        _insert_lifecycle(
+            duckdb_conn, "bd-b",
+            t0 + timedelta(minutes=30),
+            t0 + timedelta(minutes=31),
+        )
+
+        count = extract_sessions(duckdb_conn)
+        assert count == 2
+
+        sessions = duckdb_conn.execute(
+            "SELECT session_id, bead_count FROM dim_session ORDER BY session_id"
+        ).fetchall()
+        assert sessions == [("s-001", 1), ("s-002", 1)]
+
+    def test_open_beads_counted_separately(self, duckdb_conn):
+        t0 = datetime(2026, 4, 5, 21, 12, 0)
+        _insert_bead(duckdb_conn, "bd-closed")
+        _insert_hierarchy_flat(duckdb_conn, "bd-closed")
+        _insert_lifecycle(
+            duckdb_conn, "bd-closed", t0, t0 + timedelta(seconds=60),
+        )
+        _insert_bead(duckdb_conn, "bd-open")
+        _insert_hierarchy_flat(duckdb_conn, "bd-open")
+        _insert_lifecycle(
+            duckdb_conn, "bd-open", t0 + timedelta(seconds=120), None,
+        )
+
+        extract_sessions(duckdb_conn)
+        row = duckdb_conn.execute(
+            "SELECT bead_count, beads_closed, beads_open FROM dim_session"
+        ).fetchone()
+        assert row == (2, 1, 1)
+
+    def test_empty_returns_zero(self, duckdb_conn):
+        assert extract_sessions(duckdb_conn) == 0
+        assert duckdb_conn.execute(
+            "SELECT COUNT(*) FROM dim_session"
+        ).fetchone()[0] == 0
+
+    def test_session_gap_constant_is_15_min(self):
+        """Calibration target: the starting gap is 15 minutes."""
+        assert SESSION_GAP_SECS == 15 * 60
+
+
+# ============================================================
+# extract_interactions  (Thread v2)
+# ============================================================
+
+class TestExtractInteractions:
+    def test_missing_file_returns_missing_status(self, duckdb_conn, tmp_path):
+        result = extract_interactions(tmp_path, duckdb_conn)
+        assert result["status"] == "missing"
+        assert result["row_count"] == 0
+        assert "not found" in result["message"]
+
+    def test_empty_file_returns_empty_status(self, duckdb_conn, tmp_path):
+        (tmp_path / "interactions.jsonl").write_text("")
+        result = extract_interactions(tmp_path, duckdb_conn)
+        assert result["status"] == "empty"
+        assert result["row_count"] == 0
+
+    def test_populated_file_inserts_rows(self, duckdb_conn, tmp_path):
+        import json
+        records = [
+            {
+                "id": "int-1",
+                "kind": "field_change",
+                "created_at": "2026-04-05T21:12:00",
+                "actor": "u",
+                "issue_id": "bd-1",
+                "extra": {"field": "status", "old_value": "open", "new_value": "closed"},
+            },
+            {
+                "id": "int-2",
+                "kind": "llm_call",
+                "created_at": "2026-04-05T21:13:00",
+                "actor": "u",
+                "issue_id": "bd-1",
+                "model": "claude-sonnet-4-6",
+                "prompt": "hello world",
+                "response": "hi",
+            },
+        ]
+        jsonl = "\n".join(json.dumps(r) for r in records)
+        (tmp_path / "interactions.jsonl").write_text(jsonl + "\n")
+
+        result = extract_interactions(tmp_path, duckdb_conn)
+        assert result["status"] == "populated"
+        assert result["row_count"] == 2
+
+        rows = duckdb_conn.execute(
+            "SELECT interaction_id, kind, model, prompt_length, response_length "
+            "FROM fact_interactions ORDER BY interaction_id"
+        ).fetchall()
+        assert rows[0][0] == "int-1"
+        assert rows[0][1] == "field_change"
+        assert rows[1][1] == "llm_call"
+        assert rows[1][2] == "claude-sonnet-4-6"
+        assert rows[1][3] == len("hello world")
+        assert rows[1][4] == len("hi")
+
+    def test_malformed_lines_are_skipped(self, duckdb_conn, tmp_path):
+        content = (
+            '{"id": "int-1", "kind": "field_change", '
+            '"created_at": "2026-04-05T21:12:00"}\n'
+            'not valid json\n'
+            '\n'
+            '{"id": "int-2", "kind": "field_change", '
+            '"created_at": "2026-04-05T21:13:00"}\n'
+        )
+        (tmp_path / "interactions.jsonl").write_text(content)
+
+        result = extract_interactions(tmp_path, duckdb_conn)
+        assert result["status"] == "populated"
+        assert result["row_count"] == 2  # two parseable lines, malformed skipped
+
+
+# ============================================================
+# extract_agent_memories  (Thread v2)
+# ============================================================
+
+class TestExtractAgentMemories:
+    def test_memory_keys_loaded(self, duckdb_conn):
+        rows = [
+            {"key": "kv.memory.arch-pattern", "value": "use duckdb for analytics"},
+            {"key": "kv.memory.team-context", "value": "agents report to joshua"},
+        ]
+        conn = MockConn(MockCursor(rows))
+        count = extract_agent_memories(conn, duckdb_conn)
+        assert count == 2
+
+        loaded = duckdb_conn.execute(
+            "SELECT memory_key, memory_value FROM dim_agent_memory "
+            "ORDER BY memory_key"
+        ).fetchall()
+        assert loaded[0][0] == "kv.memory.arch-pattern"
+        assert loaded[1][1] == "agents report to joshua"
+
+    def test_missing_config_table_returns_zero(self, duckdb_conn):
+        class BrokenCursor:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def execute(self, *a, **k):
+                raise RuntimeError("table not found")
+            def fetchall(self): return []
+
+        conn = MockConn(BrokenCursor())
+        count = extract_agent_memories(conn, duckdb_conn)
+        assert count == 0
+
+    def test_empty_result_returns_zero(self, duckdb_conn):
+        conn = MockConn(MockCursor([]))
+        count = extract_agent_memories(conn, duckdb_conn)
+        assert count == 0
