@@ -641,6 +641,51 @@ GROUP BY b.issue_type
 ORDER BY median_cycle_secs;
 
 
+-- Compliance: late-add beads (created and claimed within 5s mid-session)
+-- A bead is "late-add" if it was created + immediately claimed while work was
+-- already underway in its session (at least one prior close already happened).
+CREATE OR REPLACE VIEW v_late_add_beads AS
+SELECT
+  f.issue_id,
+  b.title,
+  f.created_at,
+  f.first_claimed_at,
+  f.time_to_start_secs,
+  sb.session_id,
+  -- How many beads were already closed in this session before this one was created?
+  (SELECT COUNT(*)
+   FROM bridge_session_bead sb2
+   JOIN fact_bead_lifecycle f2 ON f2.issue_id = sb2.issue_id
+   WHERE sb2.session_id = sb.session_id
+     AND f2.final_closed_at IS NOT NULL
+     AND f2.final_closed_at < f.created_at
+  )                                                                   AS prior_closes_in_session
+FROM fact_bead_lifecycle f
+JOIN dim_bead b             ON b.issue_id = f.issue_id
+LEFT JOIN bridge_session_bead sb ON sb.issue_id = f.issue_id
+WHERE f.time_to_start_secs IS NOT NULL
+  AND f.time_to_start_secs < 5;
+
+
+-- Compliance: blockers added after work was already claimed
+-- These are reactive dependencies that emerged mid-execution.
+CREATE OR REPLACE VIEW v_late_add_blockers AS
+SELECT
+  da.issue_id          AS blocked_bead,
+  b1.title             AS blocked_title,
+  da.depends_on_id     AS blocker_bead,
+  b2.title             AS blocker_title,
+  da.created_at        AS added_at,
+  f.first_claimed_at   AS blocked_claimed_at
+FROM fact_dep_activity da
+JOIN fact_bead_lifecycle f  ON f.issue_id = da.issue_id
+LEFT JOIN dim_bead b1       ON b1.issue_id = da.issue_id
+LEFT JOIN dim_bead b2       ON b2.issue_id = da.depends_on_id
+WHERE da.dep_event = 'added'
+  AND da.after_first_claim = true
+  AND da.dep_type = 'blocks';
+
+
 -- Compliance: per-session rollup (skip-claim, documentation, dep violations)
 CREATE OR REPLACE VIEW v_session_compliance AS
 SELECT
