@@ -221,6 +221,60 @@ def _trend_signal(direction: str, change_pct: float | None, first_p50, second_p5
     return f"cycle time is stable ({f} to {s} median)"
 
 
+def _late_add_bead_signal(count: int, total_beads: int) -> str:
+    if count == 0:
+        return "no reactive beads detected — work matched the original plan"
+    rate = count / total_beads if total_beads > 0 else 0
+    pct = int(round(rate * 100))
+    return (
+        f"{count} bead{'s' if count != 1 else ''} ({pct}%) created and claimed "
+        f"mid-session — agents added unplanned work during execution"
+    )
+
+
+def _late_add_blocker_signal(count: int) -> str:
+    if count == 0:
+        return "no surprise blockers — dependencies were known before work started"
+    return (
+        f"{count} blocker{'s' if count != 1 else ''} added after work was already "
+        f"claimed — unexpected dependencies emerged mid-execution"
+    )
+
+
+def _title_reason_mismatch_signal(mismatch_count: int, total_pairs: int) -> str:
+    if total_pairs == 0:
+        return "no close reasons to compare — documentation rate is low"
+    if mismatch_count == 0:
+        return "close reasons align with bead titles — work matched intent"
+    pct = int(round(mismatch_count / total_pairs * 100))
+    return (
+        f"{mismatch_count} of {total_pairs} documented beads have low title/reason "
+        f"alignment ({pct}%) — agents may have done different work than scoped"
+    )
+
+
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "this", "that", "it", "its", "as", "into",
+    "not", "no", "so", "if", "up", "out", "about", "than",
+}
+
+
+def _word_overlap(a: str, b: str) -> float:
+    """Jaccard similarity on non-stopword tokens. Returns 0.0–1.0."""
+    def tokens(s):
+        import re
+        words = re.findall(r"[a-z]+", s.lower())
+        return {w for w in words if w not in _STOPWORDS and len(w) > 2}
+
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
 def _interactions_signal(total: int, by_kind: dict) -> str:
     if total == 0:
         return "no interaction data recorded"
@@ -545,6 +599,63 @@ def compute_prime(db_path: str, beads_dir: str | None = None) -> dict:
         data["dep_order_violations"] = dep_violations
         data["dep_order_signal"] = _dep_order_signal(dep_violations)
         data["dep_order_verdict"] = dep_viol_verdict
+
+        # -- Late-add beads --
+        late_rows = conn.execute(
+            "SELECT issue_id, title, time_to_start_secs, session_id, prior_closes_in_session "
+            "FROM v_late_add_beads WHERE prior_closes_in_session > 0 ORDER BY created_at"
+        ).fetchall()
+        late_add_count = len(late_rows)
+        late_add_verdict = _verdict(late_add_count == 0, late_add_count <= 2)
+        data["late_add_bead_count"] = late_add_count
+        data["late_add_bead_signal"] = _late_add_bead_signal(late_add_count, total_beads)
+        data["late_add_bead_verdict"] = late_add_verdict
+        data["late_add_beads"] = [
+            {"issue_id": r[0], "title": r[1], "time_to_start_secs": r[2],
+             "session_id": r[3], "prior_closes_in_session": r[4]}
+            for r in late_rows
+        ]
+
+        # -- Late-add blockers --
+        lab_rows = conn.execute(
+            "SELECT blocked_bead, blocked_title, blocker_bead, blocker_title, added_at "
+            "FROM v_late_add_blockers ORDER BY added_at"
+        ).fetchall()
+        late_blocker_count = len(lab_rows)
+        late_blocker_verdict = _verdict(late_blocker_count == 0, late_blocker_count <= 2)
+        data["late_add_blocker_count"] = late_blocker_count
+        data["late_add_blocker_signal"] = _late_add_blocker_signal(late_blocker_count)
+        data["late_add_blocker_verdict"] = late_blocker_verdict
+        data["late_add_blockers"] = [
+            {"blocked_bead": r[0], "blocked_title": r[1],
+             "blocker_bead": r[2], "blocker_title": r[3],
+             "added_at": str(r[4]) if r[4] else None}
+            for r in lab_rows
+        ]
+
+        # -- Title / close-reason alignment --
+        tr_rows = conn.execute(
+            "SELECT issue_id, title, close_reason FROM v_title_reason_pairs"
+        ).fetchall()
+        mismatches = []
+        for issue_id, title, reason in tr_rows:
+            if title and reason:
+                score = _word_overlap(title, reason)
+                if score < 0.2:
+                    mismatches.append({
+                        "issue_id": issue_id,
+                        "title": title,
+                        "close_reason": reason,
+                        "overlap_score": round(score, 2),
+                    })
+        mismatch_count = len(mismatches)
+        mismatch_verdict = _verdict(mismatch_count == 0, mismatch_count <= 2)
+        data["title_reason_mismatch_count"] = mismatch_count
+        data["title_reason_mismatch_signal"] = _title_reason_mismatch_signal(
+            mismatch_count, len(tr_rows)
+        )
+        data["title_reason_mismatch_verdict"] = mismatch_verdict
+        data["title_reason_mismatches"] = mismatches
 
         # -- Queue wait --
         qw_row = conn.execute(
@@ -963,10 +1074,13 @@ def format_human(data: dict) -> str:
 
     # Compliance
     lines.append("  Compliance:")
-    for label, key_val, key_sig, key_v in [
-        ("Skip-claim", "skip_claim_signal", "skip_claim_signal", "skip_claim_verdict"),
-        ("Documentation", "documentation_signal", "documentation_signal", "documentation_verdict"),
-        ("Dependency order", "dep_order_signal", "dep_order_signal", "dep_order_verdict"),
+    for label, key_sig, key_v in [
+        ("Skip-claim", "skip_claim_signal", "skip_claim_verdict"),
+        ("Documentation", "documentation_signal", "documentation_verdict"),
+        ("Dependency order", "dep_order_signal", "dep_order_verdict"),
+        ("Late-add beads", "late_add_bead_signal", "late_add_bead_verdict"),
+        ("Late-add blockers", "late_add_blocker_signal", "late_add_blocker_verdict"),
+        ("Title/reason match", "title_reason_mismatch_signal", "title_reason_mismatch_verdict"),
     ]:
         v = data.get(key_v, "good")
         sig = data.get(key_sig, "")

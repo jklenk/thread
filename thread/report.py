@@ -536,7 +536,7 @@ def _render_compliance(data, detail):
     """Compliance scorecard + detail tables."""
     parts = []
 
-    # 4-check scorecard
+    # 7-check scorecard
     checks = [
         (
             "Claim compliance",
@@ -566,6 +566,27 @@ def _render_compliance(data, detail):
             data.get("scope_stability_verdict", "watch"),
             data.get("scope_stability_signal", ""),
         ),
+        (
+            "Late-add beads",
+            f'{data.get("late_add_bead_count", 0)} reactive beads',
+            str(data.get("late_add_bead_count", 0)),
+            data.get("late_add_bead_verdict", "good"),
+            data.get("late_add_bead_signal", ""),
+        ),
+        (
+            "Late-add blockers",
+            f'{data.get("late_add_blocker_count", 0)} surprise blockers',
+            str(data.get("late_add_blocker_count", 0)),
+            data.get("late_add_blocker_verdict", "good"),
+            data.get("late_add_blocker_signal", ""),
+        ),
+        (
+            "Title/reason alignment",
+            f'{data.get("title_reason_mismatch_count", 0)} potential mismatches',
+            str(data.get("title_reason_mismatch_count", 0)),
+            data.get("title_reason_mismatch_verdict", "good"),
+            data.get("title_reason_mismatch_signal", ""),
+        ),
     ]
 
     sc_rows = []
@@ -581,7 +602,26 @@ def _render_compliance(data, detail):
 
     parts.append('<div class="scorecard">' + "".join(sc_rows) + '</div>')
 
-    # Title-reason deviations table
+    # Title/reason mismatch table (low word-overlap pairs)
+    mismatches = data.get("title_reason_mismatches", [])
+    if mismatches:
+        mm_rows = []
+        for m in mismatches:
+            score_pct = f"{int(m['overlap_score'] * 100)}%"
+            mm_rows.append(
+                f'<tr><td>{_esc(m["issue_id"])}</td><td>{_esc(m["title"])}</td>'
+                f'<td>{_esc(m["close_reason"])}</td>'
+                f'<td style="color:var(--red)">{score_pct}</td></tr>'
+            )
+        parts.append(
+            '<details open><summary>Title / reason alignment issues</summary>'
+            '<p style="color:var(--muted);font-size:0.82rem;margin-bottom:0.5rem">'
+            'Low word-overlap between bead title and close reason — agent may have done different work than scoped.</p>'
+            '<table><thead><tr><th>Bead</th><th>Title</th><th>Close reason</th><th>Overlap</th></tr></thead>'
+            '<tbody>' + "\n".join(mm_rows) + '</tbody></table></details>'
+        )
+
+    # Title-reason pairs (all documented closes, for human review)
     if detail["title_reasons"]:
         tr_rows = []
         for r in detail["title_reasons"]:
@@ -590,9 +630,48 @@ def _render_compliance(data, detail):
                 f'<td>{_esc(r[2])}</td><td>{str(r[3])[:16] if r[3] else "&mdash;"}</td></tr>'
             )
         parts.append(
-            '<details><summary>Title vs close reason pairs</summary>'
+            '<details><summary>All title vs close reason pairs</summary>'
             '<table><thead><tr><th>Bead ID</th><th>Title</th><th>Close reason</th><th>Closed</th></tr></thead>'
             '<tbody>' + "\n".join(tr_rows) + '</tbody></table></details>'
+        )
+
+    # Late-add beads table
+    late_beads = data.get("late_add_beads", [])
+    if late_beads:
+        lb_rows = []
+        for b in late_beads:
+            lb_rows.append(
+                f'<tr><td>{_esc(b["issue_id"])}</td><td>{_esc(b["title"])}</td>'
+                f'<td>{_fmt_duration(b["time_to_start_secs"])}</td>'
+                f'<td>{b["prior_closes_in_session"]}</td>'
+                f'<td>{_esc(b["session_id"])}</td></tr>'
+            )
+        parts.append(
+            '<details open><summary>Late-add beads (created mid-session)</summary>'
+            '<p style="color:var(--muted);font-size:0.82rem;margin-bottom:0.5rem">'
+            'Created and claimed within 5s while work was already underway — unplanned reactive additions.</p>'
+            '<table><thead><tr><th>Bead</th><th>Title</th><th>Claim lag</th>'
+            '<th>Prior closes</th><th>Session</th></tr></thead>'
+            '<tbody>' + "\n".join(lb_rows) + '</tbody></table></details>'
+        )
+
+    # Late-add blockers table
+    late_blockers = data.get("late_add_blockers", [])
+    if late_blockers:
+        lab_rows = []
+        for b in late_blockers:
+            lab_rows.append(
+                f'<tr><td>{_esc(b["blocked_bead"])}</td><td>{_esc(b["blocked_title"])}</td>'
+                f'<td>{_esc(b["blocker_bead"])}</td><td>{_esc(b["blocker_title"])}</td>'
+                f'<td>{str(b["added_at"])[:16] if b["added_at"] else "&mdash;"}</td></tr>'
+            )
+        parts.append(
+            '<details open><summary>Late-add blockers (added after claim)</summary>'
+            '<p style="color:var(--muted);font-size:0.82rem;margin-bottom:0.5rem">'
+            'Blocking dependency added after the dependent bead was already claimed — unexpected constraint.</p>'
+            '<table><thead><tr><th>Blocked bead</th><th>Title</th><th>Blocker</th>'
+            '<th>Blocker title</th><th>Added at</th></tr></thead>'
+            '<tbody>' + "\n".join(lab_rows) + '</tbody></table></details>'
         )
 
     # Dependency violations table
@@ -907,9 +986,10 @@ def _render_epics(data, detail):
 
 
 def _render_agent_knowledge(detail):
-    """Collapsible agent knowledge base section."""
+    """Memories summary + collapsible agent knowledge base section."""
     memories = detail["memories"]
     count = len(memories)
+
     if count == 0:
         return (
             '<section id="knowledge">'
@@ -918,6 +998,31 @@ def _render_agent_knowledge(detail):
             'Use <code>bd remember "insight"</code> to build institutional knowledge.</p>'
             '</details></section>'
         )
+
+    # Memories summary — extract key topics from memory keys
+    keys = []
+    for r in memories:
+        key = r[0]
+        if key.startswith("kv.memory."):
+            key = key[len("kv.memory."):]
+        # Use the first 3-4 words of the key as the topic label
+        label = key.replace("-", " ").replace("_", " ")
+        # Trim to ~40 chars
+        if len(label) > 40:
+            label = label[:37] + "..."
+        keys.append(label)
+
+    topics_str = "; ".join(keys[:5])
+    if len(keys) > 5:
+        topics_str += f" and {len(keys) - 5} more"
+
+    summary_html = (
+        f'<div style="background:#f0fdf4;border-left:4px solid var(--green);'
+        f'padding:0.75rem 1rem;border-radius:0 6px 6px 0;margin-bottom:1rem">'
+        f'<strong>{count} persistent memories</strong> — '
+        f'<span style="color:var(--muted)">{_esc(topics_str)}</span>'
+        f'</div>'
+    )
 
     rows = []
     for r in memories:
@@ -928,9 +1033,9 @@ def _render_agent_knowledge(detail):
 
     return (
         '<section id="knowledge">'
-        f'<details><summary>Agent knowledge base ({count} memories)</summary>'
-        f'<p style="color:var(--muted);margin-bottom:0.5rem">'
-        f'Institutional knowledge agents have accumulated across sessions</p>'
+        f'<h2>Agent knowledge base</h2>'
+        + summary_html +
+        f'<details><summary>Show all {count} memories</summary>'
         '<table><thead><tr><th style="width:25%">Key</th><th>Knowledge</th></tr></thead>'
         '<tbody>' + "\n".join(rows) + '</tbody></table></details></section>'
     )
