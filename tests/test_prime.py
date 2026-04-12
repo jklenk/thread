@@ -187,11 +187,15 @@ class TestComputePrime:
         data = compute_prime(db_path)
         assert data["interactions"]["total"] == 0
         assert data["interactions"]["status"] == "missing"
+        assert data["interactions"]["models_used"] == []
+        assert data["interactions"]["tools_used"] == []
+        assert data["interactions"]["tool_success_rate"] is None
 
     def test_agent_knowledge_zero_when_empty(self, tmp_path):
         db_path = _build_test_db(tmp_path)
         data = compute_prime(db_path)
         assert data["agent_knowledge"]["count"] == 0
+        assert data["agent_knowledge"]["memories"] == []
 
     def test_sessions_populated(self, tmp_path):
         db_path = _build_test_db(tmp_path)
