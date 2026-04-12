@@ -241,6 +241,24 @@ class TestReportAgainstSampleData:
         assert "<!DOCTYPE html>" in content
         assert "Thread report" in content
         assert "Chart" in content  # chart.js reference
-        # Headline values should be interpolated, not left as placeholders
+        # v2: 6 headline cards with verdict borders
+        assert content.count('class="card"') == 6
+        # Session timeline
+        assert "Sessions" in content
+        assert "session-row" in content
+        # Compliance scorecard
+        assert "Compliance" in content
+        assert "Claim compliance" in content
+        # Charts
+        assert "histChart" in content
+        assert "tpChart" in content
+        assert "MEDIAN_CYCLE_SECS" in content
+        # Insights
+        assert "Insights" in content
+        # Cost footer
+        assert "multiples of project median cycle time" in content
+        # No old placeholders
         assert "{fidelity}" not in content
         assert "{effort}" not in content
+        # No dollar amounts
+        assert "$" not in content
