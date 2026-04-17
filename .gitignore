@@ -216,3 +216,4 @@ thread-report.html
 thread-*-report.html
 sample-data/
 .claude/settings.local.json
+.beads/
