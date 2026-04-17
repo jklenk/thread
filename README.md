@@ -150,3 +150,7 @@ uv run pytest -m integration         # 13 integration tests (require dolt)
 ## Design doc
 
 See `docs/DESIGN_v0.7.md` for the full design rationale, including the v0.8 changelog that documents revisions discovered during live validation.
+
+<img width="1186" height="1022" alt="image" src="https://github.com/user-attachments/assets/dce36884-c292-4e36-a9f9-197b0aa849c8" />
+<img width="1184" height="877" alt="image" src="https://github.com/user-attachments/assets/239b637b-269d-4289-bc3b-6cbd516b1983" />
+
