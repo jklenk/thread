@@ -1,9 +1,5 @@
 # How to Identify Agent vs Human Activity in Beads
 
-## What the sample data tells us
-
-This dataset is a **solo Beads user** — every actor is `joshua.klenk`, every owner is an email, all agent-specific fields (`role_type`, `rig`, `agent_state`, `role_bead`, `hook_bead`, `closed_by_session`) are empty strings. No `hop://` URIs anywhere. This is the "tier 2" user the design doc anticipated.
-
 ## The identification signals, ranked by reliability
 
 ### Tier 1 — Explicit, high-confidence (Gas Town / server mode only)
@@ -16,7 +12,7 @@ This dataset is a **solo Beads user** — every actor is `joshua.klenk`, every o
 | `closed_by_session` | `issues.closed_by_session` | Claude Code session ID that closed the issue — direct proof of agent execution |
 | `hop://` URI | `events.actor` | Structured URI with platform/org/id. `platform=gastown` = agent |
 
-**These don't exist in the sample data.** They're Gas Town infrastructure. For solo users, Tier 1 is empty.
+These fields are only populated in Gas Town / server-mode deployments. For solo CLI users, Tier 1 is empty.
 
 ### Tier 2 — Behavioral heuristics (works for solo users)
 
@@ -24,11 +20,11 @@ This is where the real design challenge lives. The `actor` field is always a pla
 
 | Signal | Source | Reasoning |
 |---|---|---|
-| **Timing between events** | `events.created_at`, `dolt_diff_issues` | Agent sessions create->claim->close in tight bursts (seconds apart). Humans have gaps. In the sample data, many issues go open->in_progress->closed within 2-3 minutes. |
-| **Batch closes** | `interactions.jsonl` | Multiple issues closed within seconds of each other (the sample shows 4 closures in 12 seconds at 21:14:49-21:15:01) — this is an agent running `bd close` in a loop, not a human |
+| **Timing between events** | `events.created_at`, `dolt_diff_issues` | Agent sessions create->claim->close in tight bursts (seconds apart). Humans have gaps. Many issues go open->in_progress->closed within 2-3 minutes in agent-driven workflows. |
+| **Batch closes** | `interactions.jsonl` | Multiple issues closed within seconds of each other — this is an agent running `bd close` in a loop, not a human |
 | **`compaction_level > 0`** | `issues.compaction_level` | Compaction is triggered by context window pressure — an agent-specific concern. A compacted bead was almost certainly in an agent session |
-| **Description specificity** | `issues.description` | Agent-created beads in this dataset have extremely detailed, implementation-level descriptions ("Add methods to airflow.py that call..."). Humans write goals; agents write specs. This is a heuristic, not a rule |
-| **`close_reason` content** | `issues.close_reason` | Agent closures reference specific code artifacts ("Added resolve_dbt_model_fqns to DagRepoAnalyzer..."). Human closures tend to be terse ("Closed", "Done") |
+| **Description specificity** | `issues.description` | Agent-created beads tend to have extremely detailed, implementation-level descriptions. Humans write goals; agents write specs. This is a heuristic, not a rule |
+| **`close_reason` content** | `issues.close_reason` | Agent closures reference specific code artifacts. Human closures tend to be terse ("Closed", "Done") |
 | **`sender` field** | `issues.sender` | Set for inter-agent messages — if populated, it's agent-to-agent communication |
 | **`mol_type` / `work_type`** | `issues.mol_type`, `issues.work_type` | Molecule workflows (swarm, patrol, work) are agent-orchestrated |
 
@@ -54,8 +50,8 @@ The classification should be a **cascade**, not a binary:
 
 For the behavioral heuristic layer (step 5), the strongest solo-user signal is **event velocity** — the time delta between `created->claimed->closed`. An agent session compresses this to seconds/minutes. A human session has natural gaps.
 
-## The honest answer for this dataset
+## The honest answer for solo CLI users
 
-In this sample data, **every bead was created by a human but executed by an agent.** The human (`joshua.klenk`) wrote the issues via `bd create`, and an AI agent (Claude Code) did the implementation and called `bd close`. We know this from the close_reason content (code-level specificity no human would type into a close command) and the event timing (tight bursts). But the database doesn't *say* that explicitly — it's inference.
+In a typical solo-user dataset, **beads are created by a human but executed by an agent.** The human wrote the issues via `bd create`, and an AI agent (Claude Code) did the implementation and called `bd close`. We can infer this from close_reason content (code-level specificity) and event timing (tight bursts). But the database doesn't *say* that explicitly — it's inference.
 
-This is exactly the design tension the doc flags: for solo Beads users, `actor_classifier.py` is doing forensic inference, not reading labels. The `classification_source = 'heuristic'` tier is not a fallback — for most real-world users, it's the primary path. The design doc's isolation of this component is well-justified.
+This is the core design tension: for solo Beads users, `actor_classifier.py` is doing forensic inference, not reading labels. The `classification_source = 'heuristic'` tier is not a fallback — for most real-world users, it's the primary path. The design doc's isolation of this component is well-justified.
