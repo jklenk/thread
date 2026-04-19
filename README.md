@@ -106,7 +106,7 @@ All commands accept `--beads-dir <path>` or honor the `BEADS_DIR` environment va
 
 ## How it works
 
-1. **`thread refresh`** starts `dolt sql-server` against `.beads/embeddeddolt/`, extracts the Beads history into six DuckDB tables, and materializes five analytical views.
+1. **`thread refresh`** reads the Beads Dolt database (see [Backend modes](#backend-modes) below), extracts the history into six DuckDB tables, and materializes five analytical views.
 2. **`thread prime`** queries the views to produce a short project-health summary in plain outcome language — no technical terms, no data model jargon.
 3. **`thread report`** renders a self-contained HTML file with Chart.js from CDN: headline stats, fidelity/rework trends, and either a top-epics table or a project summary depending on workflow type.
 4. **`thread query`** is a direct DuckDB REPL replacement for ad-hoc investigation.
@@ -116,11 +116,20 @@ The analytical layer is built around three tenets:
 - **Plain outcome language** — all user-facing signal strings describe what happened, never how
 - **The bead is the atomic unit** — agents are disposable pipeline; Thread observes behavior and surfaces patterns without inferring intent
 
+## Backend modes
+
+Thread supports both Beads Dolt backends and picks the right one automatically from the on-disk layout under `.beads/`:
+
+- **Embedded** — `.beads/embeddeddolt/<db>/.dolt`. Thread spawns its own `dolt sql-server` on a free port, reads the history, and shuts the server down when it's finished. This was the original Beads default and requires nothing beyond the `dolt` binary on PATH.
+- **Server** — `.beads/dolt/` managed by `bd dolt start`. Thread reads the connection info from `bd dolt show --json` and connects to the running server directly — it never spawns its own process. This is Beads' default in recent versions and the required path for team deployments where the Dolt server is shared (possibly remote).
+
+For server mode, Thread delegates the config resolution cascade (env vars `BEADS_DOLT_*` → `.beads/metadata.json` → `.beads/config.yaml`) to bd itself, so anything you can configure through bd just works without additional Thread flags.
+
 ## Project structure
 
 ```
 thread/
-  dolt.py               # dolt sql-server lifecycle + connection management
+  dolt.py               # dolt backend detection + connection management
   extractor.py          # reads Dolt, populates thread.duckdb
   actor_classifier.py   # isolated 4-tier classification cascade
   schema.sql            # 6 tables + 5 views

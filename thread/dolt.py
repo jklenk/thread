@@ -1,7 +1,16 @@
-"""Dolt server management for Thread extraction.
+"""Dolt connection management for Thread extraction.
 
-Finds the embedded Dolt database directory, starts a dolt sql-server
-on a free port, provides a pymysql connection, and ensures clean shutdown.
+Supports both Beads Dolt backends, detecting mode automatically from
+the on-disk layout under .beads/:
+
+- Embedded: locate the database in .beads/embeddeddolt/, spawn a
+  dolt sql-server on a free port, shut it down on exit.
+- Server: read bd's resolved connection config via `bd dolt show --json`
+  and connect to the already-running bd-managed server. Never spawns —
+  bd owns the server's lifecycle (required for shared/remote team
+  deployments).
+
+All flows yield a pymysql connection; callers don't care which mode.
 """
 
 import json
