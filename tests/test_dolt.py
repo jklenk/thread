@@ -216,6 +216,50 @@ class TestReadServerConfig:
             with pytest.raises(subprocess.CalledProcessError):
                 read_server_config(bd)
 
+    def test_invalid_json_raises_value_error(self, tmp_path):
+        """Malformed JSON from bd surfaces as ValueError with context."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="not json at all",
+                returncode=0,
+            )
+
+            with pytest.raises(ValueError, match="did not return valid JSON"):
+                read_server_config(bd)
+
+    def test_missing_required_field_raises_value_error(self, tmp_path):
+        """Missing required key (e.g. dropped 'port') surfaces as ValueError."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        partial = {"host": "127.0.0.1", "database": "x", "user": "root"}
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=json.dumps(partial),
+                returncode=0,
+            )
+
+            with pytest.raises(ValueError, match="missing required fields"):
+                read_server_config(bd)
+
+    def test_non_integer_port_raises_value_error(self, tmp_path):
+        """Non-integer 'port' surfaces as ValueError rather than TypeError."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        bad_port = {**self.SAMPLE_JSON, "port": "not-a-number"}
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=json.dumps(bad_port),
+                returncode=0,
+            )
+
+            with pytest.raises(ValueError, match="'port' is not an integer"):
+                read_server_config(bd)
+
 
 class TestDoltConnectionDispatch:
     """dolt_connection routes to embedded or server mode based on .beads/ layout.
