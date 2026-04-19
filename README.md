@@ -121,7 +121,7 @@ The analytical layer is built around three tenets:
 Thread supports both Beads Dolt backends and picks the right one automatically from the on-disk layout under `.beads/`:
 
 - **Embedded** — `.beads/embeddeddolt/<db>/.dolt`. Thread spawns its own `dolt sql-server` on a free port, reads the history, and shuts the server down when it's finished. This was the original Beads default and requires nothing beyond the `dolt` binary on PATH.
-- **Server** — `.beads/dolt/` managed by `bd dolt start`. Thread reads the connection info from `bd dolt show --json` and connects to the running server directly — it never spawns its own process. This is Beads' default in recent versions and the required path for team deployments where the Dolt server is shared (possibly remote).
+- **Server** — `.beads/dolt/` managed by `bd dolt start`. Thread reads the connection info from `bd dolt show --json` (so the `bd` CLI must be on PATH) and connects to the running server directly — it never spawns its own process. This is Beads' default in recent versions and the required path for team deployments where the Dolt server is shared (possibly remote).
 
 For server mode, Thread delegates the config resolution cascade (env vars `BEADS_DOLT_*` → `.beads/metadata.json` → `.beads/config.yaml`) to bd itself, so anything you can configure through bd just works without additional Thread flags.
 
@@ -146,7 +146,8 @@ tests/                  # 90 tests (77 unit + 13 integration)
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) for dependency management
-- `dolt` binary on PATH (needed by `thread refresh`, not by unit tests)
+- For **embedded** mode: `dolt` binary on PATH (needed by `thread refresh`, not by unit tests)
+- For **server** mode: `bd` (Beads) CLI on PATH — Thread shells out to `bd dolt show --json` to resolve connection info
 
 ## Testing
 

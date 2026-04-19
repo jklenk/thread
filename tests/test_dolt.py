@@ -1,4 +1,4 @@
-"""Tests for Dolt server management."""
+"""Tests for thread.dolt: backend detection, config resolution, and connection dispatch."""
 
 import json
 import subprocess
