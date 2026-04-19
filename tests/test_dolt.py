@@ -1,11 +1,19 @@
 """Tests for Dolt server management."""
 
+import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from thread.dolt import detect_dolt_backend, find_beads_dir, find_dolt_db_dir
+from thread.dolt import (
+    ServerConfig,
+    detect_dolt_backend,
+    find_beads_dir,
+    find_dolt_db_dir,
+    read_server_config,
+)
 
 
 class TestFindBeadsDir:
@@ -101,3 +109,109 @@ class TestDetectDoltBackend:
 
         with pytest.raises(FileNotFoundError, match="embeddeddolt.*dolt"):
             detect_dolt_backend(bd)
+
+
+class TestReadServerConfig:
+    """Read resolved Dolt server config via `bd dolt show --json`.
+
+    Thread delegates config-priority resolution (env vars → metadata.json →
+    config.yaml) to bd itself rather than reimplementing the cascade.
+    """
+
+    # Real output shape from `bd dolt show --json` as of bd v1.x
+    SAMPLE_JSON = {
+        "backend": "dolt",
+        "connection_ok": True,
+        "database": "migration",
+        "host": "127.0.0.1",
+        "port": 3307,
+        "user": "root",
+    }
+
+    def test_parses_host_port_database_user(self, tmp_path):
+        """Well-formed JSON from bd dolt show --json maps to ServerConfig."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=json.dumps(self.SAMPLE_JSON),
+                returncode=0,
+            )
+            cfg = read_server_config(bd)
+
+        assert cfg.host == "127.0.0.1"
+        assert cfg.port == 3307
+        assert cfg.database == "migration"
+        assert cfg.user == "root"
+
+    def test_returns_server_config_instance(self, tmp_path):
+        """Return type is the public ServerConfig dataclass."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=json.dumps(self.SAMPLE_JSON),
+                returncode=0,
+            )
+            cfg = read_server_config(bd)
+
+        assert isinstance(cfg, ServerConfig)
+
+    def test_runs_bd_in_parent_of_beads_dir(self, tmp_path):
+        """bd auto-discovers .beads/ in its cwd; run it in the parent so
+        bd finds the same .beads/ we're asking about."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=json.dumps(self.SAMPLE_JSON),
+                returncode=0,
+            )
+            read_server_config(bd)
+
+        call = mock_run.call_args
+        assert call.kwargs.get("cwd") == str(bd.parent)
+
+    def test_invokes_bd_dolt_show_json(self, tmp_path):
+        """The subprocess call is `bd dolt show --json`."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=json.dumps(self.SAMPLE_JSON),
+                returncode=0,
+            )
+            read_server_config(bd)
+
+        # First positional arg is the command list
+        cmd = mock_run.call_args.args[0]
+        assert cmd == ["bd", "dolt", "show", "--json"]
+
+    def test_raises_if_bd_not_installed(self, tmp_path):
+        """Missing `bd` binary surfaces as FileNotFoundError."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.side_effect = FileNotFoundError("bd not on PATH")
+
+            with pytest.raises(FileNotFoundError):
+                read_server_config(bd)
+
+    def test_raises_if_bd_returns_nonzero(self, tmp_path):
+        """Non-zero exit from bd surfaces as CalledProcessError (check=True)."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["bd", "dolt", "show", "--json"],
+            )
+
+            with pytest.raises(subprocess.CalledProcessError):
+                read_server_config(bd)
