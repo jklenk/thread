@@ -10,6 +10,7 @@ import pytest
 from thread.dolt import (
     ServerConfig,
     detect_dolt_backend,
+    dolt_connection,
     find_beads_dir,
     find_dolt_db_dir,
     read_server_config,
@@ -187,7 +188,6 @@ class TestReadServerConfig:
             )
             read_server_config(bd)
 
-        # First positional arg is the command list
         cmd = mock_run.call_args.args[0]
         assert cmd == ["bd", "dolt", "show", "--json"]
 
@@ -215,3 +215,93 @@ class TestReadServerConfig:
 
             with pytest.raises(subprocess.CalledProcessError):
                 read_server_config(bd)
+
+
+class TestDoltConnectionDispatch:
+    """dolt_connection routes to embedded or server mode based on .beads/ layout.
+
+    Embedded: spawn a dolt sql-server against .beads/embeddeddolt/<db>/.dolt
+    and connect pymysql to that spawned instance (existing behavior).
+
+    Server: resolve connection info via `bd dolt show --json` and connect
+    pymysql directly to the already-running bd-managed server. Never spawn.
+    """
+
+    SAMPLE_SERVER_JSON = {
+        "backend": "dolt",
+        "connection_ok": True,
+        "database": "migration",
+        "host": "127.0.0.1",
+        "port": 3307,
+        "user": "root",
+    }
+
+    def test_embedded_mode_spawns_server_and_connects(self, tmp_path):
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+        embedded = bd / "embeddeddolt"
+        embedded.mkdir()
+        db = embedded / "my_project"
+        db.mkdir()
+        (db / ".dolt").mkdir()
+
+        with patch("thread.dolt.dolt_server") as mock_server, \
+             patch("thread.dolt.pymysql.connect") as mock_connect:
+            mock_server.return_value.__enter__.return_value = ("127.0.0.1", 12345)
+            mock_connect.return_value = MagicMock()
+
+            with dolt_connection(str(bd)):
+                pass
+
+        mock_server.assert_called_once_with(db)
+        kwargs = mock_connect.call_args.kwargs
+        assert kwargs["host"] == "127.0.0.1"
+        assert kwargs["port"] == 12345
+        assert kwargs["database"] == "my_project"
+        assert kwargs["user"] == "root"
+
+    def test_server_mode_connects_via_bd_config(self, tmp_path):
+        """Server mode reads config via bd dolt show --json and connects directly."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+        (bd / "dolt").mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run, \
+             patch("thread.dolt.pymysql.connect") as mock_connect:
+            mock_run.return_value = MagicMock(
+                stdout=json.dumps(self.SAMPLE_SERVER_JSON),
+                returncode=0,
+            )
+            mock_connect.return_value = MagicMock()
+
+            with dolt_connection(str(bd)):
+                pass
+
+        kwargs = mock_connect.call_args.kwargs
+        assert kwargs["host"] == "127.0.0.1"
+        assert kwargs["port"] == 3307
+        assert kwargs["database"] == "migration"
+        assert kwargs["user"] == "root"
+
+    def test_server_mode_does_not_spawn_dolt_server(self, tmp_path):
+        """Critical invariant: server mode never spawns its own dolt sql-server.
+
+        Spawning would collide with bd's running server on the same data dir
+        (file locks) and break the 'one server, shared' team model."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+        (bd / "dolt").mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run, \
+             patch("thread.dolt.dolt_server") as mock_server, \
+             patch("thread.dolt.pymysql.connect") as mock_connect:
+            mock_run.return_value = MagicMock(
+                stdout=json.dumps(self.SAMPLE_SERVER_JSON),
+                returncode=0,
+            )
+            mock_connect.return_value = MagicMock()
+
+            with dolt_connection(str(bd)):
+                pass
+
+        mock_server.assert_not_called()
