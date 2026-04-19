@@ -101,6 +101,9 @@ def read_server_config(beads_dir: Path) -> ServerConfig:
         FileNotFoundError: if ``bd`` is not on PATH.
         subprocess.CalledProcessError: if ``bd dolt show --json`` exits
             non-zero.
+        ValueError: if bd's output is not valid JSON, is missing any of
+            the required fields (host, port, database, user), or reports
+            a non-integer port.
     """
     result = subprocess.run(
         ["bd", "dolt", "show", "--json"],
@@ -109,10 +112,33 @@ def read_server_config(beads_dir: Path) -> ServerConfig:
         text=True,
         check=True,
     )
-    data = json.loads(result.stdout)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"bd dolt show --json did not return valid JSON; "
+            f"got: {result.stdout!r}"
+        ) from exc
+
+    required = ("host", "port", "database", "user")
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise ValueError(
+            f"bd dolt show --json output is missing required fields: "
+            f"{missing}. Got keys: {sorted(data.keys())}"
+        )
+
+    try:
+        port = int(data["port"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"bd dolt show --json 'port' is not an integer: "
+            f"{data['port']!r}"
+        ) from exc
+
     return ServerConfig(
         host=data["host"],
-        port=int(data["port"]),
+        port=port,
         database=data["database"],
         user=data["user"],
     )
