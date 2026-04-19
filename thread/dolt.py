@@ -4,15 +4,30 @@ Finds the embedded Dolt database directory, starts a dolt sql-server
 on a free port, provides a pymysql connection, and ensures clean shutdown.
 """
 
+import json
 import os
 import socket
 import subprocess
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import pymysql
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    """Resolved connection info for a bd-managed Dolt server.
+
+    Fields mirror ``bd dolt show --json`` output.
+    """
+
+    host: str
+    port: int
+    database: str
+    user: str
 
 
 def find_beads_dir(beads_dir: str | None = None) -> Path:
@@ -62,6 +77,35 @@ def detect_dolt_backend(beads_dir: Path) -> Literal["embedded", "server"]:
         return "server"
     raise FileNotFoundError(
         f"No embeddeddolt or dolt directory in {beads_dir}"
+    )
+
+
+def read_server_config(beads_dir: Path) -> ServerConfig:
+    """Resolve Dolt connection info for a server-mode ``.beads/`` directory.
+
+    Shells out to ``bd dolt show --json`` in the parent of ``beads_dir``
+    (so bd's auto-discovery finds the correct board) and parses the
+    resolved config. Delegates the config-priority cascade (env vars →
+    ``metadata.json`` → ``config.yaml``) to bd itself.
+
+    Raises:
+        FileNotFoundError: if ``bd`` is not on PATH.
+        subprocess.CalledProcessError: if ``bd dolt show --json`` exits
+            non-zero.
+    """
+    result = subprocess.run(
+        ["bd", "dolt", "show", "--json"],
+        cwd=str(beads_dir.parent),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data = json.loads(result.stdout)
+    return ServerConfig(
+        host=data["host"],
+        port=int(data["port"]),
+        database=data["database"],
+        user=data["user"],
     )
 
 
