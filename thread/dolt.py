@@ -174,18 +174,40 @@ def dolt_server(dolt_db_dir: Path):
 def dolt_connection(beads_dir: str | None = None):
     """Context manager that yields a pymysql connection to the Dolt database.
 
-    Handles server lifecycle automatically.
+    Dispatches based on backend mode:
+
+    - **embedded**: spawns a dolt sql-server against
+      ``.beads/embeddeddolt/<db>/`` and connects pymysql to the spawned
+      instance (shutdown handled on context exit).
+    - **server**: reads connection info from bd's own configuration
+      (via ``bd dolt show --json``) and connects pymysql directly.
+      Never spawns — bd owns the server's lifecycle.
     """
     bd = find_beads_dir(beads_dir)
-    db_dir = find_dolt_db_dir(bd)
-    db_name = db_dir.name
+    mode = detect_dolt_backend(bd)
 
-    with dolt_server(db_dir) as (host, port):
+    if mode == "embedded":
+        db_dir = find_dolt_db_dir(bd)
+        db_name = db_dir.name
+        with dolt_server(db_dir) as (host, port):
+            conn = pymysql.connect(
+                host=host,
+                port=port,
+                user="root",
+                database=db_name,
+                cursorclass=pymysql.cursors.DictCursor,
+            )
+            try:
+                yield conn
+            finally:
+                conn.close()
+    else:  # "server"
+        cfg = read_server_config(bd)
         conn = pymysql.connect(
-            host=host,
-            port=port,
-            user="root",
-            database=db_name,
+            host=cfg.host,
+            port=cfg.port,
+            user=cfg.user,
+            database=cfg.database,
             cursorclass=pymysql.cursors.DictCursor,
         )
         try:
