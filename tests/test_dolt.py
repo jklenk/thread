@@ -259,6 +259,20 @@ class TestReadServerConfig:
             with pytest.raises(ValueError, match="'port' is not an integer"):
                 read_server_config(bd)
 
+    def test_non_object_json_raises_value_error(self, tmp_path):
+        """bd returning non-object JSON (list/string/null) surfaces as ValueError."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        with patch("thread.dolt.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=json.dumps([1, 2, 3]),
+                returncode=0,
+            )
+
+            with pytest.raises(ValueError, match="not a JSON object"):
+                read_server_config(bd)
+
 
 class TestDoltConnectionDispatch:
     """dolt_connection routes to embedded or server mode based on .beads/ layout.
