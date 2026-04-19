@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from thread.dolt import find_beads_dir, find_dolt_db_dir
+from thread.dolt import detect_dolt_backend, find_beads_dir, find_dolt_db_dir
 
 
 class TestFindBeadsDir:
@@ -58,3 +58,46 @@ class TestFindDoltDbDir:
 
         with pytest.raises(FileNotFoundError, match="No Dolt database"):
             find_dolt_db_dir(tmp_path)
+
+
+class TestDetectDoltBackend:
+    """Detect whether .beads/ uses embedded or server-mode Dolt.
+
+    Embedded (legacy default): .beads/embeddeddolt/<db>/.dolt — thread spawns
+    its own dolt sql-server against the on-disk database.
+
+    Server (new bd default): .beads/dolt/ — bd runs/manages the dolt sql-server;
+    thread connects to it as a pymysql client. Required for team deployments
+    where the Dolt server is shared (possibly remote).
+    """
+
+    def test_embedded_mode_when_only_embeddeddolt(self, tmp_path):
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+        (bd / "embeddeddolt").mkdir()
+
+        assert detect_dolt_backend(bd) == "embedded"
+
+    def test_server_mode_when_only_dolt(self, tmp_path):
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+        (bd / "dolt").mkdir()
+
+        assert detect_dolt_backend(bd) == "server"
+
+    def test_raises_when_both_exist(self, tmp_path):
+        """Ambiguous state — user should clean up rather than have thread guess."""
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+        (bd / "embeddeddolt").mkdir()
+        (bd / "dolt").mkdir()
+
+        with pytest.raises(ValueError, match="both embeddeddolt and dolt"):
+            detect_dolt_backend(bd)
+
+    def test_raises_when_neither_present(self, tmp_path):
+        bd = tmp_path / ".beads"
+        bd.mkdir()
+
+        with pytest.raises(FileNotFoundError, match="embeddeddolt.*dolt"):
+            detect_dolt_backend(bd)
